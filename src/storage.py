@@ -1314,7 +1314,7 @@ class DatabaseManager:
             data_query = (
                 select(AnalysisHistory)
                 .where(where_clause)
-                .order_by(desc(AnalysisHistory.sentiment_score), desc(AnalysisHistory.created_at))
+                .order_by(desc(AnalysisHistory.created_at))
                 .offset(offset)
                 .limit(limit)
             )
