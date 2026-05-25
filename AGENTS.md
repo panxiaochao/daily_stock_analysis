@@ -49,18 +49,22 @@ python scripts/check_ai_assets.py
   - `apps/dsa-desktop/`：Electron 桌面端
   - `.github/workflows/`：CI、发布、每日任务
 - 核心职责：
-  - `src/core/`：主流程编排
-  - `src/services/`：业务服务层
+  - `src/core/`：主流程编排（pipeline.py, market_review.py, trading_calendar.py, backtest_engine.py 等）
+  - `src/agent/`：Agent 策略系统（orchestrator, executor, agents/, tools/, skills/, strategies/）
+  - `src/services/`：业务服务层（analyzer_service, notification, portfolio, backtest, search 等）
   - `src/repositories/`：数据访问层
   - `src/reports/`：报告生成
   - `src/schemas/`：Schema / 数据结构
-  - `data_provider/`：多数据源适配与 fallback
+  - `data_provider/`：多数据源适配与 fallback（efinance, akshare, tushare, yfinance 等 fetcher）
   - `api/`：FastAPI API
-  - `bot/`：机器人接入
+  - `bot/`：机器人接入（platforms/, commands/）
   - `scripts/`：本地脚本
   - `.github/scripts/`：GitHub 自动化脚本
   - `tests/`：pytest 测试
   - `docs/`：文档与说明
+  - `apps/dsa-web/`：React Web 前端
+  - `apps/dsa-desktop/`：Electron 桌面端
+  - `src/` 根目录：核心业务模块（analyzer.py, stock_analyzer.py, notification.py, storage.py, scheduler.py, search_service.py, config.py 等）
 
 ## 4. 常用命令
 
