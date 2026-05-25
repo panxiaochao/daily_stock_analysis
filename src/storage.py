@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, date, timedelta
@@ -73,49 +74,49 @@ class StockDaily(Base):
     支持多股票、多日期的唯一约束
     """
     __tablename__ = 'stock_daily'
-
+    
     # 主键
     id = Column(Integer, primary_key=True, autoincrement=True)
-
+    
     # 股票代码（如 600519, 000001）
     code = Column(String(10), nullable=False, index=True)
-
+    
     # 交易日期
     date = Column(Date, nullable=False, index=True)
-
+    
     # OHLC 数据
     open = Column(Float)
     high = Column(Float)
     low = Column(Float)
     close = Column(Float)
-
+    
     # 成交数据
     volume = Column(Float)  # 成交量（股）
     amount = Column(Float)  # 成交额（元）
     pct_chg = Column(Float)  # 涨跌幅（%）
-
+    
     # 技术指标
     ma5 = Column(Float)
     ma10 = Column(Float)
     ma20 = Column(Float)
     volume_ratio = Column(Float)  # 量比
-
+    
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
-
+    
     # 更新时间
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
-
+    
     # 唯一约束：同一股票同一日期只能有一条数据
     __table_args__ = (
         UniqueConstraint('code', 'date', name='uix_code_date'),
         Index('ix_code_date', 'code', 'date'),
     )
-
+    
     def __repr__(self):
         return f"<StockDaily(code={self.code}, date={self.date}, close={self.close})>"
-
+    
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典"""
         return {
@@ -624,7 +625,112 @@ class LLMUsage(Base):
     called_at = Column(DateTime, default=datetime.now, index=True)
 
 
-class DatabaseManager:
+class AlertRuleRecord(Base):
+    """Persisted alert rule managed through the Alert API."""
+
+    __tablename__ = 'alert_rules'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(64), nullable=False)
+    target_scope = Column(String(32), nullable=False, default='single_symbol', index=True)
+    target = Column(String(64), nullable=False, index=True)
+    alert_type = Column(String(32), nullable=False, index=True)
+    parameters = Column(Text, nullable=False, default='{}')
+    severity = Column(String(16), nullable=False, default='warning', index=True)
+    enabled = Column(Boolean, nullable=False, default=True, index=True)
+    source = Column(String(16), nullable=False, default='api', index=True)
+    cooldown_policy = Column(Text)
+    notification_policy = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_alert_rule_type_target', 'alert_type', 'target'),
+    )
+
+
+class AlertTriggerRecord(Base):
+    """Alert trigger history row.
+
+    P1 exposes read APIs and table shape; runtime writer integration lands in
+    later phases.
+    """
+
+    __tablename__ = 'alert_triggers'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, index=True)
+    target = Column(String(64), nullable=False, index=True)
+    observed_value = Column(Float)
+    threshold = Column(Float)
+    reason = Column(Text)
+    data_source = Column(String(64))
+    data_timestamp = Column(DateTime, index=True)
+    triggered_at = Column(DateTime, default=datetime.now, index=True)
+    status = Column(String(16), nullable=False, default='triggered', index=True)
+    diagnostics = Column(Text)
+
+    __table_args__ = (
+        Index('ix_alert_trigger_rule_time', 'rule_id', 'triggered_at'),
+    )
+
+
+class AlertNotificationRecord(Base):
+    """Notification attempt row for alert triggers.
+
+    P1 exposes read APIs and table shape; runtime writer integration lands in
+    later phases.
+    """
+
+    __tablename__ = 'alert_notifications'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    trigger_id = Column(Integer, index=True)
+    channel = Column(String(32), nullable=False, index=True)
+    attempt = Column(Integer, nullable=False, default=1)
+    success = Column(Boolean, nullable=False, default=False, index=True)
+    error_code = Column(String(64))
+    retryable = Column(Boolean, nullable=False, default=False)
+    latency_ms = Column(Integer)
+    diagnostics = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_alert_notification_trigger_channel', 'trigger_id', 'channel'),
+    )
+
+
+class AlertCooldownRecord(Base):
+    """Persisted alert cooldown state for DB-managed alert rules."""
+
+    __tablename__ = 'alert_cooldowns'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, index=True)
+    # Reserved for future non-DB/expanded-scope rules; P4 queries by rule_id.
+    rule_key = Column(String(255), index=True)
+    target = Column(String(64), nullable=False, index=True)
+    severity = Column(String(16), nullable=False, default='warning', index=True)
+    last_triggered_at = Column(DateTime, index=True)
+    cooldown_until = Column(DateTime, index=True)
+    reason = Column(Text)
+    state = Column(String(16), nullable=False, default='active', index=True)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('rule_id', 'target', 'severity', name='uix_alert_cooldown_rule_target_severity'),
+    )
+
+
+class _DatabaseManagerMeta(type):
+    """Serialize DatabaseManager construction across __new__ and __init__."""
+
+    def __call__(cls, *args, **kwargs):
+        with cls._init_lock:
+            return super().__call__(*args, **kwargs)
+
+
+class DatabaseManager(metaclass=_DatabaseManagerMeta):
     """
     数据库管理器 - 单例模式
     
@@ -633,17 +739,18 @@ class DatabaseManager:
     2. 提供 Session 上下文管理
     3. 封装数据存取操作
     """
-
+    
     _instance: Optional['DatabaseManager'] = None
+    _init_lock = threading.RLock()
     _initialized: bool = False
-
+    
     def __new__(cls, *args, **kwargs):
         """单例模式实现"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
-
+    
     def __init__(self, db_url: Optional[str] = None):
         """
         初始化数据库管理器
@@ -654,65 +761,82 @@ class DatabaseManager:
         if getattr(self, '_initialized', False):
             return
 
-        config = get_config()
-        if db_url is None:
-            db_url = config.get_db_url()
+        created_engine = None
 
-        self._db_url = db_url
-        self._sqlite_wal_enabled = config.sqlite_wal_enabled
-        self._sqlite_busy_timeout_ms = config.sqlite_busy_timeout_ms
-        self._sqlite_write_retry_max = config.sqlite_write_retry_max
-        self._sqlite_write_retry_base_delay = config.sqlite_write_retry_base_delay
+        try:
+            config = get_config()
+            if db_url is None:
+                db_url = config.get_db_url()
 
-        engine_kwargs = {
-            "echo": False,
-            "pool_pre_ping": True,
-        }
-        if str(db_url).startswith("sqlite:") and self._sqlite_busy_timeout_ms > 0:
-            engine_kwargs["connect_args"] = {
-                "timeout": self._sqlite_busy_timeout_ms / 1000,
+            self._db_url = db_url
+            self._sqlite_wal_enabled = config.sqlite_wal_enabled
+            self._sqlite_busy_timeout_ms = config.sqlite_busy_timeout_ms
+            self._sqlite_write_retry_max = config.sqlite_write_retry_max
+            self._sqlite_write_retry_base_delay = config.sqlite_write_retry_base_delay
+
+            engine_kwargs = {
+                "echo": False,
+                "pool_pre_ping": True,
             }
+            if str(db_url).startswith("sqlite:") and self._sqlite_busy_timeout_ms > 0:
+                engine_kwargs["connect_args"] = {
+                    "timeout": self._sqlite_busy_timeout_ms / 1000,
+                }
 
-        # 创建数据库引擎
-        self._engine = create_engine(
-            db_url,
-            **engine_kwargs,
-        )
-        self._is_sqlite_engine = self._engine.url.get_backend_name() == 'sqlite'
-        self._sqlite_file_db = self._is_sqlite_engine and self._is_file_sqlite_database()
-        self._install_sqlite_pragma_handler()
+            # 创建数据库引擎
+            created_engine = create_engine(
+                db_url,
+                **engine_kwargs,
+            )
+            self._engine = created_engine
+            self._is_sqlite_engine = self._engine.url.get_backend_name() == 'sqlite'
+            self._sqlite_file_db = self._is_sqlite_engine and self._is_file_sqlite_database()
+            self._install_sqlite_pragma_handler()
 
-        # 创建 Session 工厂
-        self._SessionLocal = sessionmaker(
-            bind=self._engine,
-            autocommit=False,
-            autoflush=False,
-        )
+            # 创建 Session 工厂
+            self._SessionLocal = sessionmaker(
+                bind=self._engine,
+                autocommit=False,
+                autoflush=False,
+            )
 
-        # 创建所有表
-        Base.metadata.create_all(self._engine)
+            # 创建所有表
+            Base.metadata.create_all(self._engine)
 
-        self._initialized = True
-        logger.info(f"数据库初始化完成: {db_url}")
+            self._initialized = True
+            logger.info(f"数据库初始化完成: {db_url}")
 
-        # 注册退出钩子，确保程序退出时关闭数据库连接
-        atexit.register(DatabaseManager._cleanup_engine, self._engine)
+            # 注册退出钩子，确保程序退出时关闭数据库连接
+            atexit.register(DatabaseManager._cleanup_engine, self._engine)
+        except Exception:
+            self._initialized = False
+            try:
+                if created_engine is not None:
+                    created_engine.dispose()
+            except Exception as cleanup_exc:
+                logger.warning("数据库初始化失败后的引擎清理也失败: %s", cleanup_exc)
+            self._engine = None
+            self._SessionLocal = None
+            self.__class__._instance = None
+            raise
 
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
         """获取单例实例"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
+        with cls._init_lock:
+            if cls._instance is None:
+                cls()
+            return cls._instance
+    
     @classmethod
     def reset_instance(cls) -> None:
         """重置单例（用于测试）"""
-        if cls._instance is not None:
-            if hasattr(cls._instance, '_engine') and cls._instance._engine is not None:
-                cls._instance._engine.dispose()
-            cls._instance._initialized = False
-            cls._instance = None
+        with cls._init_lock:
+            if cls._instance is not None:
+                if hasattr(cls._instance, '_engine') and cls._instance._engine is not None:
+                    cls._instance._engine.dispose()
+                cls._instance._initialized = False
+                cls._instance = None
 
     @classmethod
     def _cleanup_engine(cls, engine) -> None:
@@ -753,9 +877,9 @@ class DatabaseManager:
         return bool(database) and database.lower() != ":memory:"
 
     def _run_write_transaction(
-            self,
-            operation_name: str,
-            write_operation: Callable[[Session], T],
+        self,
+        operation_name: str,
+        write_operation: Callable[[Session], T],
     ) -> T:
         max_retries = self._sqlite_write_retry_max if self._is_sqlite_engine else 0
 
@@ -773,9 +897,9 @@ class DatabaseManager:
             except OperationalError as exc:
                 session.rollback()
                 if (
-                        self._is_sqlite_engine
-                        and self._is_sqlite_locked_error(exc)
-                        and attempt < max_retries
+                    self._is_sqlite_engine
+                    and self._is_sqlite_locked_error(exc)
+                    and attempt < max_retries
                 ):
                     delay = self._sqlite_write_retry_base_delay * (2 ** attempt)
                     logger.warning(
@@ -820,7 +944,7 @@ class DatabaseManager:
     @staticmethod
     def _normalize_sql_value(value: Any) -> Any:
         return None if pd.isna(value) else value
-
+    
     def get_session(self) -> Session:
         """
         获取数据库 Session
@@ -854,7 +978,7 @@ class DatabaseManager:
             raise
         finally:
             session.close()
-
+    
     def has_today_data(self, code: str, target_date: Optional[date] = None) -> bool:
         """
         检查是否已有指定日期的数据
@@ -873,7 +997,7 @@ class DatabaseManager:
         # 注意：这里的 target_date 语义是“自然日”，而不是“最新交易日”。
         # 在周末/节假日/非交易日运行时，即使数据库已有最新交易日数据，这里也会返回 False。
         # 该行为目前保留（按需求不改逻辑）。
-
+        
         with self.get_session() as session:
             result = session.execute(
                 select(StockDaily).where(
@@ -883,13 +1007,13 @@ class DatabaseManager:
                     )
                 )
             ).scalar_one_or_none()
-
+            
             return result is not None
-
+    
     def get_latest_data(
-            self,
-            code: str,
-            days: int = 2
+        self, 
+        code: str, 
+        days: int = 2
     ) -> List[StockDaily]:
         """
         获取最近 N 天的数据
@@ -910,17 +1034,17 @@ class DatabaseManager:
                 .order_by(desc(StockDaily.date))
                 .limit(days)
             ).scalars().all()
-
+            
             return list(results)
 
     def save_news_intel(
-            self,
-            code: str,
-            name: str,
-            dimension: str,
-            query: str,
-            response: 'SearchResponse',
-            query_context: Optional[Dict[str, str]] = None
+        self,
+        code: str,
+        name: str,
+        dimension: str,
+        query: str,
+        response: 'SearchResponse',
+        query_context: Optional[Dict[str, str]] = None
     ) -> int:
         """
         保存新闻情报到数据库
@@ -977,25 +1101,25 @@ class DatabaseManager:
                         if not existing.query_id and current_query_id:
                             existing.query_id = current_query_id
                         existing.query_source = (
-                                query_context.get("query_source") or existing.query_source
+                            query_context.get("query_source") or existing.query_source
                         )
                         existing.requester_platform = (
-                                query_context.get("requester_platform") or existing.requester_platform
+                            query_context.get("requester_platform") or existing.requester_platform
                         )
                         existing.requester_user_id = (
-                                query_context.get("requester_user_id") or existing.requester_user_id
+                            query_context.get("requester_user_id") or existing.requester_user_id
                         )
                         existing.requester_user_name = (
-                                query_context.get("requester_user_name") or existing.requester_user_name
+                            query_context.get("requester_user_name") or existing.requester_user_name
                         )
                         existing.requester_chat_id = (
-                                query_context.get("requester_chat_id") or existing.requester_chat_id
+                            query_context.get("requester_chat_id") or existing.requester_chat_id
                         )
                         existing.requester_message_id = (
-                                query_context.get("requester_message_id") or existing.requester_message_id
+                            query_context.get("requester_message_id") or existing.requester_message_id
                         )
                         existing.requester_query = (
-                                query_context.get("requester_query") or existing.requester_query
+                            query_context.get("requester_query") or existing.requester_query
                         )
                     continue
 
@@ -1043,12 +1167,12 @@ class DatabaseManager:
         return saved_count
 
     def save_fundamental_snapshot(
-            self,
-            query_id: str,
-            code: str,
-            payload: Optional[Dict[str, Any]],
-            source_chain: Optional[Any] = None,
-            coverage: Optional[Any] = None,
+        self,
+        query_id: str,
+        code: str,
+        payload: Optional[Dict[str, Any]],
+        source_chain: Optional[Any] = None,
+        coverage: Optional[Any] = None,
     ) -> int:
         """
         保存基本面快照（P0 write-only）。失败不抛异常，返回写入条数 0/1。
@@ -1068,7 +1192,6 @@ class DatabaseManager:
                     )
                 )
                 return 1
-
             return self._run_write_transaction(
                 f"save_fundamental_snapshot[{query_id}:{code}]",
                 _write,
@@ -1083,9 +1206,9 @@ class DatabaseManager:
             return 0
 
     def get_latest_fundamental_snapshot(
-            self,
-            query_id: str,
-            code: str,
+        self,
+        query_id: str,
+        code: str,
     ) -> Optional[Dict[str, Any]]:
         """
         获取指定 query_id + code 的最新基本面快照 payload。
@@ -1173,13 +1296,13 @@ class DatabaseManager:
             return list(results)
 
     def save_analysis_history(
-            self,
-            result: Any,
-            query_id: str,
-            report_type: str,
-            news_content: Optional[str],
-            context_snapshot: Optional[Dict[str, Any]] = None,
-            save_snapshot: bool = True
+        self,
+        result: Any,
+        query_id: str,
+        report_type: str,
+        news_content: Optional[str],
+        context_snapshot: Optional[Dict[str, Any]] = None,
+        save_snapshot: bool = True
     ) -> int:
         """
         保存分析结果历史记录
@@ -1216,7 +1339,6 @@ class DatabaseManager:
                     )
                 )
                 return 1
-
             return self._run_write_transaction(
                 f"save_analysis_history[{result.code}]",
                 _write,
@@ -1226,12 +1348,12 @@ class DatabaseManager:
             return 0
 
     def get_analysis_history(
-            self,
-            code: Optional[str] = None,
-            query_id: Optional[str] = None,
-            days: int = 30,
-            limit: int = 50,
-            exclude_query_id: Optional[str] = None,
+        self,
+        code: Optional[str] = None,
+        query_id: Optional[str] = None,
+        days: int = 30,
+        limit: int = 50,
+        exclude_query_id: Optional[str] = None,
     ) -> List[AnalysisHistory]:
         """
         Query analysis history records.
@@ -1266,14 +1388,14 @@ class DatabaseManager:
             ).scalars().all()
 
             return list(results)
-
+    
     def get_analysis_history_paginated(
-            self,
-            code: Optional[str] = None,
-            start_date: Optional[date] = None,
-            end_date: Optional[date] = None,
-            offset: int = 0,
-            limit: int = 20
+        self,
+        code: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        offset: int = 0,
+        limit: int = 20
     ) -> Tuple[List[AnalysisHistory], int]:
         """
         分页查询分析历史记录（带总数）
@@ -1289,10 +1411,10 @@ class DatabaseManager:
             Tuple[List[AnalysisHistory], int]: (记录列表, 总数)
         """
         from sqlalchemy import func
-
+        
         with self.get_session() as session:
             conditions = []
-
+            
             if code:
                 conditions.append(AnalysisHistory.code == code)
             if start_date:
@@ -1300,16 +1422,15 @@ class DatabaseManager:
                 conditions.append(AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time()))
             if end_date:
                 # created_at < end_date+1 00:00:00 (即 <= end_date 23:59:59)
-                conditions.append(
-                    AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
-
+                conditions.append(AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time()))
+            
             # 构建 where 子句
             where_clause = and_(*conditions) if conditions else True
-
+            
             # 查询总数
             total_query = select(func.count(AnalysisHistory.id)).where(where_clause)
             total = session.execute(total_query).scalar() or 0
-
+            
             # 查询分页数据
             data_query = (
                 select(AnalysisHistory)
@@ -1319,9 +1440,9 @@ class DatabaseManager:
                 .limit(limit)
             )
             results = session.execute(data_query).scalars().all()
-
+            
             return list(results), total
-
+    
     def get_analysis_history_by_id(self, record_id: int) -> Optional[AnalysisHistory]:
         """
         根据数据库主键 ID 查询单条分析历史记录
@@ -1386,12 +1507,12 @@ class DatabaseManager:
                 .limit(1)
             ).scalars().first()
             return result
-
+    
     def get_data_range(
-            self,
-            code: str,
-            start_date: date,
-            end_date: date
+        self, 
+        code: str, 
+        start_date: date, 
+        end_date: date
     ) -> List[StockDaily]:
         """
         获取指定日期范围的数据
@@ -1416,14 +1537,14 @@ class DatabaseManager:
                 )
                 .order_by(StockDaily.date)
             ).scalars().all()
-
+            
             return list(results)
-
+    
     def save_daily_data(
-            self,
-            df: pd.DataFrame,
-            code: str,
-            data_source: str = "Unknown"
+        self, 
+        df: pd.DataFrame, 
+        code: str,
+        data_source: str = "Unknown"
     ) -> int:
         """
         保存日线数据到数据库
@@ -1485,7 +1606,7 @@ class DatabaseManager:
                 existing_dates = set()
                 _COUNT_CHUNK = 500
                 for j in range(0, len(batch_dates), _COUNT_CHUNK):
-                    chunk_dates = batch_dates[j: j + _COUNT_CHUNK]
+                    chunk_dates = batch_dates[j : j + _COUNT_CHUNK]
                     if not chunk_dates:
                         continue
                     existing_dates.update(
@@ -1502,7 +1623,7 @@ class DatabaseManager:
                     record for record in records if record['date'] not in existing_dates
                 ]
                 for i in range(0, len(records), _SQLITE_CHUNK):
-                    chunk = records[i: i + _SQLITE_CHUNK]
+                    chunk = records[i : i + _SQLITE_CHUNK]
                     stmt = sqlite_insert(StockDaily).values(chunk)
                     excluded = stmt.excluded
                     session.execute(
@@ -1570,11 +1691,11 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"保存 {code} 数据失败: {e}")
             raise
-
+    
     def get_analysis_context(
-            self,
-            code: str,
-            target_date: Optional[date] = None
+        self, 
+        code: str,
+        target_date: Optional[date] = None
     ) -> Optional[Dict[str, Any]]:
         """
         获取分析所需的上下文数据
@@ -1594,42 +1715,42 @@ class DatabaseManager:
         # 并不会按 target_date 精确取当日/前一交易日的上下文。
         # 因此若未来需要支持“按历史某天复盘/重算”的可解释性，这里需要调整。
         # 该行为目前保留（按需求不改逻辑）。
-
+        
         # 获取最近2天数据
         recent_data = self.get_latest_data(code, days=2)
-
+        
         if not recent_data:
             logger.warning(f"未找到 {code} 的数据")
             return None
-
+        
         today_data = recent_data[0]
         yesterday_data = recent_data[1] if len(recent_data) > 1 else None
-
+        
         context = {
             'code': code,
             'date': today_data.date.isoformat(),
             'today': today_data.to_dict(),
         }
-
+        
         if yesterday_data:
             context['yesterday'] = yesterday_data.to_dict()
-
+            
             # 计算相比昨日的变化
             if yesterday_data.volume and yesterday_data.volume > 0:
                 context['volume_change_ratio'] = round(
                     today_data.volume / yesterday_data.volume, 2
                 )
-
+            
             if yesterday_data.close and yesterday_data.close > 0:
                 context['price_change_ratio'] = round(
                     (today_data.close - yesterday_data.close) / yesterday_data.close * 100, 2
                 )
-
+            
             # 均线形态判断
             context['ma_status'] = self._analyze_ma_status(today_data)
-
+        
         return context
-
+    
     def _analyze_ma_status(self, data: StockDaily) -> str:
         """
         分析均线形态
@@ -1646,7 +1767,7 @@ class DatabaseManager:
         ma5 = data.ma5 or 0
         ma10 = data.ma10 or 0
         ma20 = data.ma20 or 0
-
+        
         if close > ma5 > ma10 > ma20 > 0:
             return "多头排列 📈"
         elif close < ma5 < ma10 < ma20 and ma20 > 0:
@@ -1680,12 +1801,12 @@ class DatabaseManager:
             pass
 
         for fmt in (
-                "%Y-%m-%d %H:%M:%S",
-                "%Y-%m-%d %H:%M",
-                "%Y-%m-%d",
-                "%Y/%m/%d %H:%M:%S",
-                "%Y/%m/%d %H:%M",
-                "%Y/%m/%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%Y/%m/%d",
         ):
             try:
                 return datetime.strptime(text, fmt)
@@ -1747,7 +1868,7 @@ class DatabaseManager:
         if yuan_pos != -1:
             segment_start = colon_pos + 1 if colon_pos != -1 else 0
             segment = text[segment_start:yuan_pos]
-
+            
             # 使用 finditer 并过滤掉 MA 开头的数字
             matches = list(re.finditer(r"-?\d+(?:\.\d+)?", segment))
             valid_numbers = []
@@ -1755,11 +1876,11 @@ class DatabaseManager:
                 # 检查前面是否是 "MA" (忽略大小写)
                 start_idx = m.start()
                 if start_idx >= 2:
-                    prefix = segment[start_idx - 2:start_idx].upper()
+                    prefix = segment[start_idx-2:start_idx].upper()
                     if prefix == "MA":
                         continue
                 valid_numbers.append(m.group())
-
+            
             if valid_numbers:
                 try:
                     return abs(float(valid_numbers[-1]))
@@ -1778,7 +1899,7 @@ class DatabaseManager:
         valid_numbers = []
         for m in re.finditer(r"\d+(?:\.\d+)?", search_text):
             start_idx = m.start()
-            if start_idx >= 2 and search_text[start_idx - 2:start_idx].upper() == "MA":
+            if start_idx >= 2 and search_text[start_idx-2:start_idx].upper() == "MA":
                 continue
             valid_numbers.append(m.group())
         if valid_numbers:
@@ -1861,10 +1982,10 @@ class DatabaseManager:
 
     @staticmethod
     def _build_fallback_url_key(
-            code: str,
-            title: str,
-            source: str,
-            published_date: Optional[datetime]
+        code: str,
+        title: str,
+        source: str,
+        published_date: Optional[datetime]
     ) -> str:
         """
         生成无 URL 时的去重键（确保稳定且较短）
@@ -1910,10 +2031,10 @@ class DatabaseManager:
             return session.execute(stmt).scalar() is not None
 
     def get_chat_sessions(
-            self,
-            limit: int = 50,
-            session_prefix: Optional[str] = None,
-            extra_session_ids: Optional[List[str]] = None,
+        self,
+        limit: int = 50,
+        session_prefix: Optional[str] = None,
+        extra_session_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         获取聊天会话列表（从 conversation_messages 聚合）
@@ -2029,13 +2150,13 @@ class DatabaseManager:
     # ------------------------------------------------------------------
 
     def record_llm_usage(
-            self,
-            call_type: str,
-            model: str,
-            prompt_tokens: int,
-            completion_tokens: int,
-            total_tokens: int,
-            stock_code: Optional[str] = None,
+        self,
+        call_type: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        stock_code: Optional[str] = None,
     ) -> None:
         """Append one LLM call record to llm_usage."""
         row = LLMUsage(
@@ -2050,9 +2171,9 @@ class DatabaseManager:
             session.add(row)
 
     def get_llm_usage_summary(
-            self,
-            from_dt: datetime,
-            to_dt: datetime,
+        self,
+        from_dt: datetime,
+        to_dt: datetime,
     ) -> Dict[str, Any]:
         """Return aggregated token usage between from_dt and to_dt.
 
@@ -2120,10 +2241,10 @@ def get_db() -> DatabaseManager:
 
 
 def persist_llm_usage(
-        usage: Dict[str, Any],
-        model: str,
-        call_type: str,
-        stock_code: Optional[str] = None,
+    usage: Dict[str, Any],
+    model: str,
+    call_type: str,
+    stock_code: Optional[str] = None,
 ) -> None:
     """Fire-and-forget: write one LLM call record to llm_usage. Never raises."""
     try:
@@ -2143,16 +2264,16 @@ def persist_llm_usage(
 if __name__ == "__main__":
     # 测试代码
     logging.basicConfig(level=logging.DEBUG)
-
+    
     db = get_db()
-
+    
     print("=== 数据库测试 ===")
     print(f"数据库初始化成功")
-
+    
     # 测试检查今日数据
     has_data = db.has_today_data('600519')
     print(f"茅台今日是否有数据: {has_data}")
-
+    
     # 测试保存数据
     test_df = pd.DataFrame({
         'date': [date.today()],
@@ -2168,10 +2289,10 @@ if __name__ == "__main__":
         'ma20': [1790.0],
         'volume_ratio': [1.2],
     })
-
+    
     saved = db.save_daily_data(test_df, '600519', 'TestSource')
     print(f"保存测试数据: {saved} 条")
-
+    
     # 测试获取上下文
     context = db.get_analysis_context('600519')
     print(f"分析上下文: {context}")
